@@ -1,3 +1,100 @@
 <!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>器官分配协调台</title>
-<style>body{font:15px system-ui;max-width:1080px;margin:40px auto;background:#f5f7fb;padding:0 20px;color:#172033}section{background:white;padding:20px;border-radius:12px;box-shadow:0 2px 12px #0001}pre{background:#0f172a;color:#86efac;padding:16px;overflow:auto;border-radius:8px}input,button{font:inherit;padding:8px;margin:4px}button{background:#be123c;color:white;border:0;border-radius:6px}</style>
-<h1>器官分配协调台</h1><p>查看当前可用器官、候选患者和分配进度。写操作通过 JSON API 完成，医院接口需携带 X-Hospital。</p><section><input id="u" value="allocator"><input id="r" value="allocation_officer"><button onclick="load()">刷新</button><pre id="o"></pre></section><script>async function load(){let r=await fetch('/api/state',{headers:{'X-User-Id':u.value,'X-Role':r.value}});o.textContent=JSON.stringify(await r.json(),null,2)}load()</script>
+<style>
+body{font:15px system-ui;max-width:1080px;margin:40px auto;background:#f5f7fb;padding:0 20px;color:#172033}
+section{background:white;padding:20px;border-radius:12px;box-shadow:0 2px 12px #0001;margin-bottom:20px}
+pre{background:#0f172a;color:#86efac;padding:16px;overflow:auto;border-radius:8px}
+input,button{font:inherit;padding:8px;margin:4px}button{background:#be123c;color:white;border:0;border-radius:6px;cursor:pointer}
+button.ghost{background:#334155}table{border-collapse:collapse;width:100%}td,th{border:1px solid #e2e8f0;padding:6px 8px;text-align:left}
+.ok{color:#15803d;font-weight:600}.bad{color:#b91c1c;font-weight:600}.tag{background:#e2e8f0;border-radius:4px;padding:1px 6px;font-size:12px}
+h2{margin-top:0}ul{margin:6px 0;padding-left:20px}
+</style>
+<h1>器官分配协调台</h1>
+
+<section id="entry">
+<h2>办理入口</h2>
+<div>
+<input id="u" value="allocator" title="X-User-Id"><input id="r" value="allocation_officer" title="X-Role"><input id="h" placeholder="X-Hospital(医院角色)" title="X-Hospital">
+<button class="ghost" onclick="loadState()">刷新总览</button>
+</div>
+<div>
+<input id="aid" type="number" placeholder="分配编号" style="width:90px">
+<button class="ghost" onclick="loadAllocation()">查看分配</button>
+<button class="ghost" onclick="loadOptions()">可改派名单</button>
+<button class="ghost" onclick="loadAudit()">查看记录</button>
+</div>
+<div>
+<input id="eta" placeholder="预计抵达 ISO 时间 如 2026-09-25T18:00:00Z" size="34"><button onclick="reportEta()">医院上报预计抵达</button>
+</div>
+<div>
+<input id="rev" type="number" placeholder="expected_revision" style="width:150px"><button onclick="acceptAlloc()">医院接受分配</button>
+<input id="wreason" placeholder="撤回原因"><button onclick="withdrawAlloc()">医院撤回</button>
+</div>
+<div>
+<input id="ncid" type="number" placeholder="新候选人ID" style="width:110px"><input id="rsreason" placeholder="改派原因(必填)"><button onclick="reassign()">分配员改派</button>
+</div>
+<pre id="msg">操作结果显示在这里</pre>
+</section>
+
+<section id="view">
+<h2>分配与候选人</h2>
+<div id="summary">尚未加载分配</div>
+<h3>改派历史(原候选人 → 新候选人)</h3>
+<div id="history">无</div>
+<h3>可改派名单(按剩余可用分钟筛选)</h3>
+<div id="options">尚未加载名单</div>
+</section>
+
+<section id="rules">
+<h2>改派规则</h2>
+<ul>
+<li>剩余可用分钟 = 器官到期时间 − 当前时间;候选患者转运分钟(transit_minutes)不超过剩余可用分钟才算赶得上。</li>
+<li>医院上报预计抵达时间后,若原患者来不及接收,医院可撤回分配(转运开始前)。</li>
+<li>分配员只能从赶得上的名单中改派,必须填写改派原因;改派后分配回到“待接受”,需新医院重新确认,原预计抵达时间作废。</li>
+<li>改派后旧医院再用原分配编号确认,接口返回 <span class="tag">allocation_reassigned</span> 提示内容已经变化。</li>
+<li>转运开始后(in_transit 起)不能撤回也不能改派;器官到期后所有流转被阻止。</li>
+</ul>
+</section>
+
+<section id="records">
+<h2>记录</h2>
+<pre id="audit">审计与改派记录显示在这里</pre>
+</section>
+
+<section id="overview">
+<h2>总览</h2>
+<pre id="o"></pre>
+</section>
+
+<script>
+const $=id=>document.getElementById(id);
+function hdrs(){let h={'X-User-Id':u.value,'X-Role':r.value,'Content-Type':'application/json'};if($('h').value)h['X-Hospital']=$('h').value;return h}
+async function api(path,method,body){let r=await fetch(path,{method:method||'GET',headers:hdrs(),body:body?JSON.stringify(body):undefined});let j=await r.json();if(!r.ok)throw j;return j}
+function show(x){msg.textContent=typeof x==='string'?x:JSON.stringify(x,null,2)}
+async function run(fn){try{await fn()}catch(e){show(e.message?e.error+': '+e.message:JSON.stringify(e))}}
+function allocId(){let v=parseInt(aid.value);if(!v)throw{error:'input',message:'请填写分配编号'};return v}
+
+async function loadState(){run(async()=>{o.textContent=JSON.stringify(await api('/api/state'),null,2)})}
+async function loadAllocation(){run(async()=>{let a=await api('/api/allocations/'+allocId());renderAllocation(a);show(a)})}
+async function loadOptions(){run(async()=>{let d=await api('/api/allocations/'+allocId()+'/reassign-options');renderOptions(d);show(d)})}
+async function loadAudit(){run(async()=>{let d=await api('/api/allocations/'+allocId()+'/audit');audit.textContent=JSON.stringify(d,null,2)})}
+async function reportEta(){run(async()=>{let a=await api('/api/allocations/'+allocId()+'/eta','POST',{eta_at:eta.value});renderAllocation(a);show(a)})}
+async function acceptAlloc(){run(async()=>{let a=await api('/api/allocations/'+allocId()+'/accept','POST',{expected_revision:parseInt(rev.value)});renderAllocation(a);show(a)})}
+async function withdrawAlloc(){run(async()=>{let a=await api('/api/allocations/'+allocId()+'/withdraw','POST',{reason:wreason.value});renderAllocation(a);show(a)})}
+async function reassign(){run(async()=>{let a=await api('/api/allocations/'+allocId()+'/reassign','POST',{candidate_id:parseInt(ncid.value),reason:rsreason.value});renderAllocation(a);show(a)})}
+
+function renderAllocation(a){
+  summary.innerHTML=`<table><tr><th>分配</th><td>#${a.id} 状态 ${a.status} 版本 ${a.revision}</td></tr>
+<tr><th>当前候选人</th><td>${a.patient_name}(${a.candidate_hospital})</td></tr>
+<tr><th>预计抵达</th><td>${a.eta_at||'未上报'}${a.eta_reported_by?' 上报方:'+a.eta_reported_by:''}</td></tr>
+<tr><th>器官到期</th><td>${a.expires_at} 剩余约 <b>${a.remaining_minutes}</b> 分钟</td></tr></table>`;
+  history.innerHTML=a.reassignments&&a.reassignments.length?'<ul>'+a.reassignments.map(x=>
+    `<li>#${x.id} ${x.from_patient_name}(${x.from_hospital}) → <b>${x.to_patient_name}(${x.to_hospital})</b> 原因:${x.reason} ${x.created_at}</li>`).join('')+'</ul>':'无';
+}
+function renderOptions(d){
+  options.innerHTML=`<p>剩余可用 <b>${d.remaining_minutes}</b> 分钟,预计抵达 ${d.eta_at||'未上报'},器官到期 ${d.expires_at}</p>
+<table><tr><th>名次</th><th>ID</th><th>患者</th><th>医院</th><th>转运分钟</th><th>是否赶得上</th><th>备注</th></tr>`+
+d.candidates.map(c=>`<tr><td>${c.rank}</td><td>${c.id}</td><td>${c.patient_name}</td><td>${c.hospital}</td><td>${c.transit_minutes}</td>
+<td class="${c.feasible?'ok':'bad'}">${c.feasible?'赶得上':'来不及'}</td><td>${c.current?'<span class="tag">原候选人</span>':''}</td></tr>`).join('')+'</table>';
+}
+loadState()
+</script>

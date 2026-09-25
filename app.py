@@ -55,13 +55,19 @@ class Repository:
             id INTEGER PRIMARY KEY AUTOINCREMENT, patient_name TEXT NOT NULL, blood_type TEXT NOT NULL, organ TEXT NOT NULL,
             hospital TEXT NOT NULL, region TEXT NOT NULL, urgency INTEGER NOT NULL, wait_days INTEGER NOT NULL,
             willing INTEGER NOT NULL DEFAULT 1, clinical_match INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'active',
-            created_by TEXT NOT NULL, created_at TEXT NOT NULL
+            transit_minutes INTEGER NOT NULL DEFAULT 60, created_by TEXT NOT NULL, created_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS allocations(
             id INTEGER PRIMARY KEY AUTOINCREMENT, donor_id INTEGER NOT NULL UNIQUE REFERENCES donors(id), candidate_id INTEGER NOT NULL REFERENCES candidates(id),
             score REAL NOT NULL, status TEXT NOT NULL DEFAULT 'proposed', revision INTEGER NOT NULL DEFAULT 1,
-            cold_chain_temp REAL, delayed_minutes INTEGER NOT NULL DEFAULT 0, created_by TEXT NOT NULL, created_at TEXT NOT NULL,
+            cold_chain_temp REAL, delayed_minutes INTEGER NOT NULL DEFAULT 0, eta_at TEXT, eta_reported_by TEXT,
+            created_by TEXT NOT NULL, created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL, accepted_at TEXT, implanted_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS reassignments(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, allocation_id INTEGER NOT NULL REFERENCES allocations(id),
+            from_candidate_id INTEGER NOT NULL REFERENCES candidates(id), to_candidate_id INTEGER NOT NULL REFERENCES candidates(id),
+            reason TEXT NOT NULL, created_by TEXT NOT NULL, created_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS handoffs(
             id INTEGER PRIMARY KEY AUTOINCREMENT, allocation_id INTEGER NOT NULL REFERENCES allocations(id), from_hospital TEXT NOT NULL,
@@ -74,6 +80,16 @@ class Repository:
             action TEXT NOT NULL, detail_json TEXT NOT NULL, created_at TEXT NOT NULL
         );
         """)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        def columns(table: str) -> set[str]:
+            return {row["name"] for row in self.conn.execute(f"PRAGMA table_info({table})")}
+        if "transit_minutes" not in columns("candidates"):
+            self.conn.execute("ALTER TABLE candidates ADD COLUMN transit_minutes INTEGER NOT NULL DEFAULT 60")
+        for column in ("eta_at", "eta_reported_by"):
+            if column not in columns("allocations"):
+                self.conn.execute(f"ALTER TABLE allocations ADD COLUMN {column} TEXT")
 
     @contextmanager
     def tx(self):
@@ -122,13 +138,16 @@ class OrganAllocationService:
         required = ("patient_name", "blood_type", "organ", "hospital", "region")
         if any(not body.get(k) for k in required): raise ApiError(400, "missing_fields", "候选患者基础信息不完整")
         blood = str(body["blood_type"]).upper(); urgency = body.get("urgency"); wait_days = body.get("wait_days", 0)
+        transit = body.get("transit_minutes", 60)
         if blood not in {"O", "A", "B", "AB"} or not isinstance(urgency, int) or not 1 <= urgency <= 5 or not isinstance(wait_days, int) or wait_days < 0:
             raise ApiError(400, "invalid_candidate", "血型、1-5 紧急度和非负等待天数无效")
+        if not isinstance(transit, int) or isinstance(transit, bool) or not 1 <= transit <= 10080:
+            raise ApiError(400, "invalid_transit_minutes", "transit_minutes 必须为 1-10080 的整数分钟")
         with self.repo.tx() as conn:
-            cur = conn.execute("""INSERT INTO candidates(patient_name,blood_type,organ,hospital,region,urgency,wait_days,willing,clinical_match,created_by,created_at)
-                                  VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+            cur = conn.execute("""INSERT INTO candidates(patient_name,blood_type,organ,hospital,region,urgency,wait_days,willing,clinical_match,transit_minutes,created_by,created_at)
+                                  VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
                                (body["patient_name"], blood, str(body["organ"]).lower(), body["hospital"], body["region"], urgency, wait_days,
-                                int(body.get("willing", True)), int(body.get("clinical_match", 0)), actor, iso()))
+                                int(body.get("willing", True)), int(body.get("clinical_match", 0)), transit, actor, iso()))
             return dict(conn.execute("SELECT * FROM candidates WHERE id=?", (cur.lastrowid,)).fetchone())
 
     @staticmethod
@@ -187,6 +206,20 @@ class OrganAllocationService:
         if role == "hospital" and hospital != row["candidate_hospital"]:
             result["patient_name"] = "***"
         result["handoff"] = self._row(conn.execute("SELECT * FROM handoffs WHERE allocation_id=?", (allocation_id,)).fetchone())
+        result["remaining_minutes"] = max(0, int((parse_time(row["expires_at"]) - utcnow()).total_seconds() // 60))
+        reassignments = []
+        for entry in conn.execute("""SELECT r.id,r.from_candidate_id,r.to_candidate_id,r.reason,r.created_by,r.created_at,
+                                            cf.patient_name from_patient_name,cf.hospital from_hospital,
+                                            ct.patient_name to_patient_name,ct.hospital to_hospital
+                                     FROM reassignments r JOIN candidates cf ON cf.id=r.from_candidate_id
+                                     JOIN candidates ct ON ct.id=r.to_candidate_id
+                                     WHERE r.allocation_id=? ORDER BY r.id""", (allocation_id,)):
+            item = dict(entry)
+            if role == "hospital":
+                if item["from_hospital"] != hospital: item["from_patient_name"] = "***"
+                if item["to_hospital"] != hospital: item["to_patient_name"] = "***"
+            reassignments.append(item)
+        result["reassignments"] = reassignments
         return result
 
     def _ensure_active(self, conn: sqlite3.Connection, allocation_id: int, actor: str, role: str) -> sqlite3.Row:
@@ -208,7 +241,11 @@ class OrganAllocationService:
         with self.repo.tx() as conn:
             row = self._ensure_active(conn, allocation_id, actor, role)
             candidate = conn.execute("SELECT * FROM candidates WHERE id=?", (row["candidate_id"],)).fetchone()
-            if candidate["hospital"] != hospital: raise ApiError(403, "wrong_hospital", "只能由候选患者所在医院接受")
+            if candidate["hospital"] != hospital:
+                prior = conn.execute("""SELECT 1 FROM reassignments r JOIN candidates c ON c.id=r.from_candidate_id
+                                        WHERE r.allocation_id=? AND c.hospital=? LIMIT 1""", (allocation_id, hospital)).fetchone()
+                if prior: raise ApiError(409, "allocation_reassigned", "该分配已改派给其他候选患者，原分配编号的内容已变化")
+                raise ApiError(403, "wrong_hospital", "只能由候选患者所在医院接受")
             if row["status"] == "accepted": return self._allocation(conn, allocation_id, role, hospital)
             if row["status"] != "proposed": raise ApiError(409, "invalid_transition", "当前状态不能接受")
             if row["revision"] != expected: raise ApiError(409, "revision_conflict", "分配信息已发生变化")
@@ -237,6 +274,20 @@ class OrganAllocationService:
             conn.execute("UPDATE allocations SET delayed_minutes=delayed_minutes+?,revision=revision+1,updated_at=? WHERE id=?", (minutes, iso(), allocation_id))
             Repository.audit(conn, allocation_id, row["donor_id"], actor, role, "logistics_delay", {"minutes": minutes, "reason": reason, "at_risk": minutes >= 120})
             return self._allocation(conn, allocation_id, role, "")
+
+    def report_eta(self, allocation_id: int, actor: str, role: str, hospital: str, body: dict[str, Any]) -> dict[str, Any]:
+        if role != "hospital": raise ApiError(403, "eta_forbidden", "只有医院可以上报预计抵达时间")
+        eta = parse_time(body.get("eta_at"))
+        with self.repo.tx() as conn:
+            row = self._ensure_active(conn, allocation_id, actor, role)
+            donor = conn.execute("SELECT * FROM donors WHERE id=?", (row["donor_id"],)).fetchone()
+            candidate = conn.execute("SELECT * FROM candidates WHERE id=?", (row["candidate_id"],)).fetchone()
+            if hospital not in {donor["hospital"], candidate["hospital"]}: raise ApiError(403, "wrong_hospital", "只有来源或接收医院可以上报预计抵达时间")
+            remaining = int((parse_time(donor["expires_at"]) - eta).total_seconds() // 60)
+            conn.execute("UPDATE allocations SET eta_at=?,eta_reported_by=?,revision=revision+1,updated_at=? WHERE id=?", (iso(eta), hospital, iso(), allocation_id))
+            Repository.audit(conn, allocation_id, row["donor_id"], actor, role, "eta_reported",
+                             {"eta_at": iso(eta), "hospital": hospital, "minutes_spare_at_arrival": remaining, "on_time": remaining >= 0})
+            return self._allocation(conn, allocation_id, role, hospital)
 
     def initiate_handoff(self, allocation_id: int, actor: str, role: str, hospital: str, body: dict[str, Any]) -> dict[str, Any]:
         if role != "hospital": raise ApiError(403, "handoff_forbidden", "只有医院可以发起交接")
@@ -298,6 +349,60 @@ class OrganAllocationService:
             Repository.audit(conn, allocation_id, row["donor_id"], actor, role, "allocation_withdrawn", {"reason": reason})
             return self._allocation(conn, allocation_id, role, hospital)
 
+    def reassign_options(self, allocation_id: int, role: str) -> dict[str, Any]:
+        if role not in {"coordinator", "allocation_officer", "auditor"}: raise ApiError(403, "options_forbidden", "只有调度、分配员或审计员可以查看改派名单")
+        conn = self.repo.conn
+        row = conn.execute("SELECT * FROM allocations WHERE id=?", (allocation_id,)).fetchone()
+        if not row: raise ApiError(404, "allocation_not_found", "分配不存在")
+        donor = conn.execute("SELECT * FROM donors WHERE id=?", (row["donor_id"],)).fetchone()
+        remaining = max(0, int((parse_time(donor["expires_at"]) - utcnow()).total_seconds() // 60))
+        candidates = []
+        for candidate in conn.execute("SELECT * FROM candidates WHERE organ=? AND status='active' AND willing=1", (donor["organ"],)):
+            if not blood_compatible(donor["blood_type"], candidate["blood_type"]): continue
+            item = dict(candidate); item["match"] = self._score(donor, candidate)
+            item["current"] = candidate["id"] == row["candidate_id"]
+            item["feasible"] = candidate["transit_minutes"] <= remaining
+            candidates.append(item)
+        candidates.sort(key=lambda item: (not item["feasible"], -item["match"]["total"], item["id"]))
+        for index, item in enumerate(candidates, 1): item["rank"] = index
+        return {"allocation_id": allocation_id, "status": row["status"], "eta_at": row["eta_at"], "expires_at": donor["expires_at"],
+                "remaining_minutes": remaining, "candidates": candidates}
+
+    def reassign(self, allocation_id: int, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
+        if role != "allocation_officer": raise ApiError(403, "reassign_forbidden", "只有分配员可以改派")
+        candidate_id, reason = body.get("candidate_id"), str(body.get("reason", "")).strip()
+        if not isinstance(candidate_id, int) or not reason: raise ApiError(400, "invalid_reassign", "candidate_id 和改派原因 reason 必填")
+        with self.repo.tx() as conn:
+            row = conn.execute("SELECT * FROM allocations WHERE id=?", (allocation_id,)).fetchone()
+            if not row: raise ApiError(404, "allocation_not_found", "分配不存在")
+            if row["status"] in {"implanted", "expired"}: raise ApiError(409, "allocation_closed", "分配已结束")
+            if row["status"] not in {"proposed", "accepted", "withdrawn"}: raise ApiError(409, "invalid_transition", "转运开始后不能改派")
+            expected = body.get("expected_revision")
+            if expected is not None and row["revision"] != expected: raise ApiError(409, "revision_conflict", "分配信息已发生变化")
+            donor = conn.execute("SELECT * FROM donors WHERE id=?", (row["donor_id"],)).fetchone()
+            if parse_time(donor["expires_at"]) <= utcnow():
+                conn.execute("UPDATE allocations SET status='expired',revision=revision+1,updated_at=? WHERE id=?", (iso(), allocation_id))
+                conn.execute("UPDATE donors SET status='expired',revision=revision+1 WHERE id=?", (donor["id"],))
+                Repository.audit(conn, allocation_id, donor["id"], actor, role, "allocation_expired", {"reason": "organ_window_elapsed"})
+                raise ApiError(409, "organ_expired", "器官已经超过可用时间，禁止继续流转")
+            candidate = conn.execute("SELECT * FROM candidates WHERE id=?", (candidate_id,)).fetchone()
+            if not candidate: raise ApiError(404, "not_found", "候选患者不存在")
+            if candidate_id == row["candidate_id"]: raise ApiError(409, "same_candidate", "新候选患者不能与原候选患者相同")
+            if candidate["status"] != "active" or not candidate["willing"]: raise ApiError(409, "candidate_unavailable", "候选患者当前不可接受分配")
+            if donor["organ"] != candidate["organ"] or not blood_compatible(donor["blood_type"], candidate["blood_type"]):
+                raise ApiError(409, "medical_mismatch", "器官类型或血型不匹配")
+            remaining = int((parse_time(donor["expires_at"]) - utcnow()).total_seconds() // 60)
+            if candidate["transit_minutes"] > remaining:
+                raise ApiError(409, "transit_window_exceeded", f"剩余可用 {remaining} 分钟，该候选患者转运需要 {candidate['transit_minutes']} 分钟，来不及接收")
+            conn.execute("""UPDATE allocations SET candidate_id=?,status='proposed',accepted_at=NULL,eta_at=NULL,eta_reported_by=NULL,
+                            revision=revision+1,updated_at=? WHERE id=?""", (candidate_id, iso(), allocation_id))
+            conn.execute("UPDATE donors SET status='allocated',revision=revision+1 WHERE id=?", (donor["id"],))
+            conn.execute("INSERT INTO reassignments(allocation_id,from_candidate_id,to_candidate_id,reason,created_by,created_at) VALUES(?,?,?,?,?,?)",
+                         (allocation_id, row["candidate_id"], candidate_id, reason, actor, iso()))
+            Repository.audit(conn, allocation_id, donor["id"], actor, role, "allocation_reassigned",
+                             {"from_candidate_id": row["candidate_id"], "to_candidate_id": candidate_id, "reason": reason, "previous_status": row["status"]})
+            return self._allocation(conn, allocation_id, role, "")
+
     def get_allocation(self, allocation_id: int, role: str, hospital: str) -> dict[str, Any]:
         return self._allocation(self.repo.conn, allocation_id, role, hospital)
 
@@ -344,6 +449,7 @@ class Handler(BaseHTTPRequestHandler):
         if len(parts) == 4 and parts[:2] == ["api", "donors"] and parts[2].isdigit() and parts[3] == "ranking": return 200, self.service.ranking(int(parts[2]), role, hospital)
         if len(parts) == 3 and parts[:2] == ["api", "allocations"] and parts[2].isdigit(): return 200, self.service.get_allocation(int(parts[2]), role, hospital)
         if len(parts) == 4 and parts[:2] == ["api", "allocations"] and parts[2].isdigit() and parts[3] == "audit": return 200, {"audit": self.service.audit(int(parts[2]), role)}
+        if len(parts) == 4 and parts[:2] == ["api", "allocations"] and parts[2].isdigit() and parts[3] == "reassign-options": return 200, self.service.reassign_options(int(parts[2]), role)
         raise ApiError(404, "not_found", "接口不存在")
     def dispatch_post(self, path: str) -> tuple[int, Any]:
         actor, role, hospital = self.service.identity(self.headers); body = self.read_body(); parts = [p for p in path.split("/") if p]
@@ -360,6 +466,8 @@ class Handler(BaseHTTPRequestHandler):
                 "withdraw": lambda: self.service.withdraw(aid, actor, role, hospital, body),
                 "transit": lambda: self.service.mark_transit(aid, actor, role, body),
                 "delay": lambda: self.service.report_delay(aid, actor, role, body),
+                "eta": lambda: self.service.report_eta(aid, actor, role, hospital, body),
+                "reassign": lambda: self.service.reassign(aid, actor, role, body),
                 "handoff": lambda: self.service.initiate_handoff(aid, actor, role, hospital, body),
                 "handoff-accept": lambda: self.service.accept_handoff(aid, actor, role, hospital, body),
                 "implant": lambda: self.service.implant(aid, actor, role, body),
