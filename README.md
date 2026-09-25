@@ -19,9 +19,14 @@ python3 app.py --db organ_allocation.db
 - `POST /api/allocations`：提出唯一分配。
 - `POST /api/allocations/{id}/accept`、`withdraw`：医院确认或撤回。
 - `POST /api/allocations/{id}/transit`、`delay`：冷链转运和延误上报。
+- `POST /api/allocations/{id}/eta`：医院上报预计抵达时间（来源或接收医院）。
+- `GET /api/allocations/{id}/reassign-options`：按剩余可用分钟（失效时间 − 预计抵达，未上报按当前时间）筛出准备时间（`prep_minutes`）赶得上的候选患者。
+- `POST /api/allocations/{id}/reassign`：转运前改派。分配编号不变、版本号递增、状态回到 `proposed`，改派原因写入改派记录与审计；剩余分钟不足、转运已开始或器官过期都会被拒绝。改派后旧医院再按原编号和旧版本确认会收到 `revision_conflict`（分配信息已发生变化）。
 - `POST /api/allocations/{id}/handoff`、`handoff-accept`：来源医院发起、接收医院确认。
 - `POST /api/allocations/{id}/implant`：确认植入。
 - `GET /api/allocations/{id}/audit`、`GET /api/state`：完整审计和权限视图。
+
+首页分三个独立区块维护：改派规则（只读说明）、办理入口（查询、上报 ETA、筛选名单、撤回、改派、确认）和记录（改派记录与分配列表），分配详情展示原候选人、新候选人和预计抵达时间。
 
 ## 测试
 
